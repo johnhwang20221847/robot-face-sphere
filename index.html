@@ -1,0 +1,848 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Robot Face Sphere</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0563c9; overflow: hidden; cursor: none; }
+  canvas#face { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+  #debug {
+    position: fixed; right: 12px; bottom: 12px; display: none;
+    background: rgba(0,0,0,.6); color: #fff; font: 12px/1.6 -apple-system, sans-serif;
+    padding: 8px; border-radius: 8px; cursor: default; width: 320px;
+  }
+  #debug canvas { width: 320px; height: 240px; display: block; border-radius: 4px; }
+  #debug .bar { height: 6px; background: rgba(255,255,255,.2); border-radius: 3px; margin: 2px 0 4px; }
+  #debug .bar i { display: block; height: 100%; border-radius: 3px; }
+  #msg {
+    position: fixed; left: 50%; bottom: 6vh; transform: translateX(-50%);
+    color: rgba(255,255,255,.85); font: 15px -apple-system, sans-serif; text-align: center;
+  }
+</style>
+</head>
+<body>
+<canvas id="face"></canvas>
+<div id="debug">
+  <canvas id="cam" width="320" height="240"></canvas>
+  <div id="info"></div>
+  <div>멈춤 (목표 달성까지)</div><div class="bar"><i id="barStill" style="background:#5ff0ff"></i></div>
+  <div>움직임 (다음 경고 단계까지)</div><div class="bar"><i id="barMove" style="background:#ff5a4a"></i></div>
+</div>
+<div id="msg">카메라 준비 중…</div>
+<video id="video" playsinline muted style="display:none"></video>
+
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "./lib/tasks-vision/vision_bundle.mjs";
+
+// ───────────────────────── 설정 (전시 환경에 맞게 조절) ─────────────────────────
+const CONFIG = {
+  fg: "#ffffff",            // 눈·눈썹 색
+  faceScale: 0.105,         // 얼굴 크기 (화면 짧은 변 대비)
+  edgeMargin: 0.03,         // 얼굴이 화면 끝에 닿기 전 남겨 둘 여백 (화면 짧은 변 대비)
+  trackGainX: 1.25,         // 좌우 민감도: 1 = 카메라 화면 끝 ↔ 모니터 화면 끝 1:1
+  trackGainY: 1.6,          // 상하 민감도
+  trackCenterY: 0.4,        // 카메라 화면에서 이 높이에 머리가 있으면 얼굴이 화면 세로 가운데
+  mirror: true,             // 좌우 반전 (M 키로 전환)
+  enterFrames: 6,           // 연속 N프레임 감지되면 '입장'으로 판단
+  leaveMs: 1200,            // 인식 대상이 이 시간 동안 안 보이면 '사라짐' → 리셋 후 두리번거림
+  lockRadius: 1.6,          // 대상 고정 범위 (어깨너비 배수)
+  minPersonSize: 0.06,      // 이보다 작게(멀리) 보이는 사람은 무시
+
+  // ── 멈춤 감지 민감도 (1초에 어깨너비 몇 개만큼 움직였는지) ──
+  stillSpeed: 0.7,          // 이보다 느리면 '멈춤'
+  moveSpeed: 1.2,           // 이보다 빠르면 다시 '움직임'
+
+  // ── 시간 (ms) ──
+  stillGoalMs: 1500,        // 이만큼 멈춰 있으면 목표 달성
+  warnAfterMs: 2500,        // 따라보는 중 이만큼 움직이면 → 걱정(노랑)
+  angryAfterMs: 2500,       // 걱정 중 이만큼 더 움직이면 → 화남(빨강)
+  rageAfterMs: 2000,        // 화남 중 이만큼 더 움직이면 → 격노(점점 커짐)
+  rageGrowMs: 8000,         // 격노 시작 후 화면을 꽉 채우기까지
+  celebrateMs: 5500,        // 환호 지속 시간
+  doneMaxMs: 45000,         // 목표 달성 후, 사람이 계속 있어도 이 시간 지나면 다시 반응
+};
+
+// 배경색 (RGB)
+const COLOR = {
+  blue:   [5, 99, 201],
+  yellow: [245, 184, 0],
+  amber:  [240, 138, 0],
+  red:    [226, 35, 26],
+  red2:   [185, 14, 14],
+  blood:  [110, 0, 4],
+  dark:   [38, 0, 2],
+};
+
+// ───────────────────────── 표정 정의 ─────────────────────────
+// 단위: 눈 반지름(R). 눈썹 = [x 오프셋, y 오프셋, 길이, 기울기(rad, +는 오른쪽 끝이 아래), 휘어짐(+는 위로 볼록)]
+const EXPR = {
+  brooding:    { L: [0, -2.45, 2.35, 0.00, 0.16],   R: [0.05, -1.97, 2.25, 0.02, 0.0],  eyeArc: 1, eyeY: 0,   eyeScale: 1 },
+  aware:       { L: [-0.45, -2.4, 1.7, -0.48, 0.15], R: [0.45, -2.4, 1.7, 0.48, 0.15],   eyeArc: 1, eyeY: 0,   eyeScale: 1.04 },
+  angry:       { L: [0.12, -2.28, 1.85, 0.39, 0],    R: [-0.12, -2.28, 1.85, -0.39, 0],  eyeArc: 1, eyeY: 0,   eyeScale: 1.02 },
+  celebrating: { L: [-0.93, -1.95, 1.45, -0.6, 0.12], R: [0.93, -1.95, 1.45, 0.6, 0.12], eyeArc: 0, eyeY: 0.3, eyeScale: 1.05 },
+};
+const EYE_GAP = 1.6, EYE_THICK = 0.68, BROW_THICK = 0.58;
+
+const STATE_EXPR = { idle: "brooding", track: "brooding", done: "brooding", warn: "aware", angry: "angry", rage: "angry", celebrate: "celebrating" };
+const STATE_LABEL = { idle: "두리번거림", track: "따라보기", warn: "걱정(경고)", angry: "화남", rage: "격노(커짐)", celebrate: "환호", done: "목표 달성 → 두리번거림" };
+const ACT_LABEL = { look: "두리번", peek: "가장자리에서 빼꼼", doze: "꾸벅 졸다 화들짝", skeptic: "실눈 곁눈질", wonder: "반짝 눈", tilt: "갸웃", hop: "통통 이동", spin: "눈 굴리기" };
+
+// ───────────────────────── 캔버스 ─────────────────────────
+const cv = document.getElementById("face");
+const ctx = cv.getContext("2d");
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = window.devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  cv.width = W * DPR; cv.height = H * DPR;
+}
+addEventListener("resize", resize); resize();
+
+// ───────────────────────── 유틸 ─────────────────────────
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b - a);
+const pick = (arr) => arr[(Math.random() * arr.length) | 0];
+const mixRGB = (a, b, t) => a.map((v, i) => lerp(v, b[i], clamp(t, 0, 1)));
+const rgb = (c) => `rgb(${c.map(Math.round).join(",")})`;
+const ease = (t) => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+// 구간 [0,a]에서 서서히 들어오고 [b,1]에서 서서히 빠지는 0~1 곡선
+const env = (t, a, b) => Math.min(ease(t / a), ease((1 - t) / (1 - b)));
+function spring(s, target, k, d, dt) {
+  const a = (target - s.x) * k - s.v * d;
+  s.v += a * dt; s.x += s.v * dt;
+}
+
+// ───────────────────────── 표정 보정값(모디파이어) ─────────────────────────
+// 기본 표정(EXPR) 위에 덧씌워지는 값들. 매 프레임 목표값으로 부드럽게 이동.
+const MOD0 = {
+  lid: 0,        // 눈꺼풀 (0 = 뜸, 1 = 감음)
+  close: 0,      // 눈을 가로로 납작하게 감음 (졸음, 0~1)
+  lidTilt: 0,    // 눈꺼풀 기울기 (+ = 안쪽이 내려감 → 화난 눈)
+  px: 0, py: 0,  // 동공(링 안쪽 구멍) 위치 (-1 ~ 1)
+  pScale: 1,     // 동공 크기 (작을수록 놀람·공포)
+  sparkle: 0,    // 동공 속 반짝임 (0~1)
+  eyeMul: 1,     // 눈 크기 배율
+  bL: 0, bR: 0,  // 눈썹 높이 보정 (- = 위로)
+  baL: 0, baR: 0,// 눈썹 기울기 보정
+  tilt: 0,       // 얼굴 전체 기울기 (rad)
+  sx: 1, sy: 1,  // 찌그러짐·늘어남 (통통 튀는 느낌)
+  shake: 0,      // 떨림 세기
+  ox: 0, oy: 0,  // 추가 위치 이동 (화면 비율) — 가장자리 밖으로 빼꼼 등
+};
+const mods = { ...MOD0 };
+
+// ───────────────────────── 상태 ─────────────────────────
+const gaze = { x: { x: 0, v: 0 }, y: { x: 0, v: 0 } };
+const browLag = { x: { x: 0, v: 0 }, y: { x: 0, v: 0 } };
+let gazeTarget = { x: 0, y: 0 };
+let springKD = [140, 17];
+let expr = structuredClone(EXPR.brooding);
+let blink = 0, nextBlink = performance.now() + 2000, blinkStart = -1;
+let bg = [...COLOR.blue];
+let rageShown = 0;
+
+let state = "idle", stateStart = 0;
+let moveMs = 0, stillMs = 0;
+let forced = false;
+
+function setState(s, now) {
+  state = s; stateStart = now; moveMs = 0; stillMs = 0;
+  if (s === "celebrate") burstConfetti();
+  if (s === "idle" || s === "done") startAct("look", now, rand(2500, 4000));
+}
+
+// ───────────────────────── 대기 중 연기 (두리번거림 상태의 다양한 동작) ─────────────────────────
+//  look    두리번: 시선을 이리저리 옮기며 동공이 먼저 움직임
+//  peek    화면 가장자리 밖으로 숨었다가 빼꼼 들여다봄
+//  doze    가운데서 꾸벅꾸벅 눈이 감기다 → 화들짝 깸
+//  skeptic 실눈 뜨고 한쪽 눈썹 올리며 곁눈질
+//  wonder  눈이 커지고 동공이 반짝반짝
+//  tilt    고개를 갸웃하며 한쪽 눈썹을 올림
+//  hop     화면을 통통 튀며 다른 곳으로 이동
+//  spin    동공을 한 바퀴 굴림
+const ACT_WEIGHTS = { look: 3, peek: 1.3, doze: 1, skeptic: 1.1, wonder: 1, tilt: 1, hop: 1.2, spin: 0.8 };
+const ACT_DUR = { look: [3500, 6500], peek: [4500, 6000], doze: [6500, 8000], skeptic: [3800, 5000], wonder: [3200, 4200], tilt: [2600, 3400], hop: [2200, 2800], spin: [2000, 2400] };
+let act = { name: "look", start: 0, dur: 3000, side: 1, toX: 0, lastName: "" };
+let idleNext = 0;
+
+function startAct(name, now, dur) {
+  const prev = act.name;
+  act = {
+    name, start: now, dur: dur ?? rand(...ACT_DUR[name]),
+    side: Math.random() < .5 ? -1 : 1,
+    fromX: gaze.x.x, fromY: gaze.y.x,
+    toX: rand(-0.9, 0.9), toY: rand(-0.5, 0.4),
+    lastName: prev,
+  };
+  idleNext = 0;
+}
+function nextAct(now) {
+  // 같은 연기가 연달아 나오지 않게, 사이사이 두리번을 끼워 넣음
+  if (act.name !== "look") return startAct("look", now, rand(2500, 4500));
+  const entries = Object.entries(ACT_WEIGHTS).filter(([n]) => n !== "look" && n !== act.lastName);
+  let r = Math.random() * entries.reduce((s, [, w]) => s + w, 0);
+  for (const [n, w] of entries) { if ((r -= w) <= 0) return startAct(n, now); }
+  startAct("look", now);
+}
+
+function idleSaccade(now) {
+  if (now < idleNext) return;
+  const r = Math.random();
+  if (r < 0.15) { gazeTarget = { x: rand(-.15, .15), y: rand(-.1, .1) }; idleNext = now + rand(600, 1200); }
+  else if (r < 0.3) { gazeTarget = { x: -Math.sign(gazeTarget.x || 1) * rand(.6, 1), y: rand(-.4, .3) }; idleNext = now + rand(350, 600); }
+  else { const s = Math.random() < .5 ? -1 : 1; gazeTarget = { x: s * rand(.45, 1), y: rand(-.6, .5) }; idleNext = now + rand(900, 2200); }
+}
+
+// 대기 연기 → 목표 모디파이어(T) 설정
+function idleAct(now, T) {
+  const t = (now - act.start) / act.dur;
+  if (t >= 1) { nextAct(now); return idleAct(now, T); }
+  const s = act.side, sec = now / 1000;
+  springKD = [55, 11];
+
+  switch (act.name) {
+    case "look": {
+      springKD = [140, 17];
+      idleSaccade(now);
+      // 동공이 얼굴보다 먼저 가는 방향을 봄
+      T.px = clamp((gazeTarget.x - gaze.x.x) * 1.6 + gazeTarget.x * 0.3, -1, 1);
+      T.py = clamp((gazeTarget.y - gaze.y.x) * 1.4 + gazeTarget.y * 0.3, -1, 1);
+      // 크게 고개를 돌릴 때 눈썹이 살짝 들림
+      T.bL = T.bR = -Math.min(0.3, Math.abs(gazeTarget.x - gaze.x.x) * 0.35);
+      break;
+    }
+    case "peek": {
+      // 0~0.25 가장자리로 쏙 숨음 → 0.25~0.8 빼꼼 → 0.8~1 다시 나옴
+      const out = env(t, 0.22, 0.8);
+      gazeTarget = { x: s * lerp(0.2, 1, out), y: lerp(0, act.toY * 0.6, out) };
+      T.ox = s * 0.2 * out;                        // 얼굴 절반이 화면 밖으로
+      T.tilt = -s * 0.16 * out;
+      const look = t > 0.3 && t < 0.8;
+      T.px = look ? -s * 0.95 : s * 0.6;
+      T.py = look ? Math.sin(sec * 5) * 0.35 : 0;
+      T.bL = T.bR = look ? -0.35 : 0;
+      if (s > 0) T.bL -= 0.2 * out; else T.bR -= 0.2 * out;
+      break;
+    }
+    case "doze": {
+      // 가운데로 와서 꾸벅꾸벅 → 거의 감김 → 화들짝!
+      gazeTarget = { x: 0, y: 0.1 };
+      const wake = 0.74;
+      if (t < wake) {
+        const sleepy = ease((t - 0.08) / 0.55);
+        const nod = Math.max(0, Math.sin(sec * 2.2)) * 0.12 * sleepy;   // 꾸벅
+        T.close = clamp(sleepy * 0.9 + nod, 0, 0.95);   // 가로로 가늘게 감기는 눈
+
+        T.py = 0.5 * sleepy; T.bL = T.bR = 0.3 * sleepy;
+        T.oy = Math.sin(sec * 1.6) * 0.012 + nod * 0.08;
+        T.tilt = Math.sin(sec * 0.8) * 0.06 * sleepy;
+      } else if (t < wake + 0.07) {               // 화들짝
+        T.lid = 0; T.eyeMul = 1.32; T.pScale = 0.5; T.bL = T.bR = -0.75;
+        T.shake = 0.06; T.oy = -0.035; T.sy = 1.12; T.sx = 0.92; T._rate = 30;
+      } else {                                     // 두리번 확인
+        T.eyeMul = 1.08; T.pScale = 0.8; T.bL = T.bR = -0.3;
+        T.px = Math.sign(Math.sin(sec * 7)) * 0.9;
+      }
+      break;
+    }
+    case "skeptic": {
+      gazeTarget = { x: lerp(act.fromX, -s * 0.35, ease(t * 3)), y: 0 };
+      const e = env(t, 0.15, 0.85);
+      T.lid = 0.48 * e + Math.sin(sec * 3) * 0.04 * e;
+      T.px = s * 0.95 * e;
+      if (s > 0) { T.bR = -0.55 * e; T.bL = 0.2 * e; T.baL = 0.12 * e; }
+      else       { T.bL = -0.55 * e; T.bR = 0.2 * e; T.baR = -0.12 * e; }
+      break;
+    }
+    case "wonder": {
+      gazeTarget = { x: lerp(act.fromX, act.toX * 0.5, ease(t * 2.5)), y: -0.35 };
+      const e = env(t, 0.12, 0.85);
+      T.eyeMul = 1 + 0.18 * e; T.pScale = 1 + 0.25 * e; T.sparkle = e;
+      T.bL = T.bR = -0.45 * e; T.py = -0.4 * e;
+      T.oy = -Math.abs(Math.sin(sec * Math.PI * 2)) * 0.02 * e;
+      break;
+    }
+    case "tilt": {
+      const e = env(t, 0.2, 0.8);
+      gazeTarget = { x: act.fromX * 0.7, y: act.fromY * 0.7 };
+      T.tilt = s * 0.26 * e;
+      T.px = s * 0.5 * e; T.py = -0.6 * e;
+      if (s > 0) T.bL = -0.5 * e; else T.bR = -0.5 * e;
+      T.eyeMul = 1 + 0.06 * e;
+      break;
+    }
+    case "hop": {
+      // 3번 통통 뛰며 다른 위치로 이동
+      const hops = 3, ph = (t * hops) % 1, k = Math.floor(t * hops);
+      const stepX = lerp(act.fromX, act.toX, Math.min(1, (k + ease(ph)) / hops));
+      gazeTarget = { x: stepX, y: lerp(act.fromY, act.toY, t) };
+      springKD = [160, 18];
+      const air = Math.sin(ph * Math.PI);
+      T.oy = -air * 0.1;
+      const land = Math.max(0, 1 - air * 5);      // 착지 순간 찌그러짐
+      T.sy = 1 + air * 0.08 - land * 0.16; T.sx = 1 - air * 0.05 + land * 0.12;
+      T.px = Math.sign(act.toX - act.fromX) * 0.6; T.py = 0.3 - air * 0.6;
+      T.bL = T.bR = -air * 0.35;
+      T._rate = 25;
+      break;
+    }
+    case "spin": {
+      const a = ease(t) * Math.PI * 2 * (s > 0 ? 1 : -1) - Math.PI / 2;
+      const e = env(t, 0.1, 0.9);
+      T.px = Math.cos(a) * e; T.py = Math.sin(a) * e;
+      T.bL = T.bR = -0.2 * e;
+      T._rate = 20;
+      break;
+    }
+  }
+}
+
+// 감상자 반응 단계 → 목표 모디파이어(T)
+function stateMods(now, T) {
+  const age = now - stateStart, sec = now / 1000;
+  // 동공은 감상자 쪽(얼굴이 향하는 방향)을 바라봄
+  T.px = clamp(gaze.x.x * 0.45 + gaze.x.v * 0.15, -1, 1);
+  T.py = clamp(gaze.y.x * 0.45 + gaze.y.v * 0.15, -1, 1);
+  springKD = [60, 13];
+
+  switch (state) {
+    case "track": {
+      // 발견! — 눈이 커지고 반짝, 눈썹이 톡 올라감
+      const pop = 1 - ease(age / 900);
+      T.eyeMul = 1 + 0.2 * pop; T.sparkle = pop; T.pScale = 1 + 0.1 * pop;
+      T.bL = T.bR = -0.45 * pop; T.sy = 1 + 0.08 * pop;
+      if (age < 120) T._rate = 30;
+      break;
+    }
+    case "warn": {
+      const p = clamp(moveMs / CONFIG.angryAfterMs, 0, 1);
+      T.eyeMul = 1.08 + 0.16 * p;          // 눈이 점점 커지고
+      T.pScale = 0.78 - 0.28 * p;          // 동공은 점점 작아짐 (불안)
+      T.bL = T.bR = -0.2 - 0.25 * p;
+      T.shake = 0.008 + 0.02 * p;
+      T.px *= 0.5; T.py = T.py * 0.5 - 0.1;
+      break;
+    }
+    case "angry": {
+      const p = clamp(moveMs / CONFIG.rageAfterMs, 0, 1);
+      const beat = Math.pow(Math.max(0, Math.sin(sec * Math.PI * 2.2)), 8);   // 씩씩
+      T.lid = 0.3 + 0.08 * p; T.lidTilt = 0.38;   // 눈꺼풀이 안쪽으로 내려와 노려봄
+      T.pScale = 0.62 - 0.12 * p;
+      T.eyeMul = 1.02 + 0.05 * beat;
+      T.bL = T.bR = 0.12 + 0.1 * beat;
+      T.shake = 0.018 + 0.015 * p + beat * 0.02;
+      break;
+    }
+    case "rage": {
+      const g = rageShown;
+      const beat = Math.pow(Math.max(0, Math.sin(sec * Math.PI * (1.4 + g * 1.6))), 6);
+      T.lid = 0.36; T.lidTilt = 0.42;
+      T.pScale = 0.45 - 0.2 * g;           // 동공이 점점 바늘처럼
+      T.eyeMul = 1.03 + 0.06 * beat;
+      T.bL = T.bR = 0.15 + 0.1 * beat;
+      T.shake = 0.025 + 0.04 * g + beat * 0.02;
+      break;
+    }
+    case "celebrate": {
+      if (age < 450) {                      // 반짝 놀람 → 웃는 눈
+        T.eyeMul = 1.25; T.sparkle = 1; T.pScale = 1.2; T.bL = T.bR = -0.55; T.sy = 1.1; T._rate = 25;
+      } else {
+        const b = Math.abs(Math.sin((age - 450) / 1000 * Math.PI * 2.4));
+        T.oy = -b * 0.05; T.sy = 1 + b * 0.06 - (1 - b) * 0.06; T.sx = 1 - b * 0.04 + (1 - b) * 0.05;
+        T.tilt = Math.sin(age / 1000 * Math.PI * 1.2) * 0.08;
+        T.px = T.py = 0;
+      }
+      break;
+    }
+  }
+}
+
+// ───────────────────────── 카메라 + 사람 인식 ─────────────────────────
+const video = document.getElementById("video");
+const msg = document.getElementById("msg");
+const camCv = document.getElementById("cam"), camCtx = camCv.getContext("2d");
+const info = document.getElementById("info");
+let landmarker = null, lastVideoTime = -1, lastDetect = 0;
+let seenFrames = 0, lastSeen = -1e9, person = null, people = [];
+let torso = null, torsoHist = [], speed = 0, moving = true;
+
+async function initVision() {
+  const fileset = await FilesetResolver.forVisionTasks("./lib/tasks-vision/wasm");
+  const opts = (delegate) => ({
+    baseOptions: { modelAssetPath: "./models/pose_landmarker_lite.task", delegate },
+    runningMode: "VIDEO", numPoses: 3,
+    minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5,
+  });
+  try { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("GPU")); }
+  catch { landmarker = await PoseLandmarker.createFromOptions(fileset, opts("CPU")); }
+}
+
+async function initCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false,
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+
+function summarize(lm) {
+  const nose = lm[0], ls = lm[11], rs = lm[12];
+  const vis = (p) => (p.visibility ?? 1) > 0.5;
+  const size = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+  const tx = (ls.x + rs.x) / 2, ty = (ls.y + rs.y) / 2;
+  let x, y;
+  if (vis(nose)) { x = nose.x; y = nose.y; }
+  else { x = tx; y = ty - size * 0.6; }
+  return { x, y, tx, ty, size };
+}
+
+// 움직임 측정: 몸통(어깨 중심)을 걸러낸 뒤 0.6초 구간 이동량 → 미세한 움직임은 무시
+function measureMotion(p, now) {
+  const dtf = Math.max(now - lastDetect, 1) / 1000;
+  const a = 1 - Math.exp(-dtf / 0.15);
+  torso = torso ? { x: lerp(torso.x, p.tx, a), y: lerp(torso.y, p.ty, a), s: lerp(torso.s, p.size, a) }
+                : { x: p.tx, y: p.ty, s: p.size };
+  torsoHist.push({ t: now, ...torso });
+  while (torsoHist.length && now - torsoHist[0].t > 600) torsoHist.shift();
+  const o = torsoHist[0], span = (now - o.t) / 1000;
+  if (span < 0.3) return;
+  const lateral = Math.hypot(torso.x - o.x, torso.y - o.y) / torso.s;
+  const depth = Math.abs(Math.log(torso.s / o.s)) * 1.5;
+  speed = (lateral + depth) / span;
+  if (moving && speed < CONFIG.stillSpeed) moving = false;
+  else if (!moving && speed > CONFIG.moveSpeed) moving = true;
+}
+
+function detect(now) {
+  if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
+  lastVideoTime = video.currentTime;
+  const res = landmarker.detectForVideo(video, now);
+  people = res.landmarks.map(summarize).filter(p => p.size >= CONFIG.minPersonSize);
+
+  // 대상 고정: 한 번 식별된 감상자만 계속 따라감
+  let best = null;
+  if (person) {
+    const lostSec = (now - lastSeen) / 1000;
+    const gate = Math.max(0.1, person.size * CONFIG.lockRadius) + Math.min(lostSec, 1) * 0.25;
+    let bd = Infinity;
+    for (const p of people) {
+      const ratio = p.size / person.size;
+      if (ratio < 0.55 - lostSec * 0.1 || ratio > 1.8 + lostSec * 0.2) continue;
+      const d = Math.hypot(p.tx - person.tx, p.ty - person.ty);
+      if (d < gate && d < bd) { bd = d; best = p; }
+    }
+  } else if (people.length) {
+    best = people.reduce((a, b) => (b.size > a.size ? b : a));
+  }
+
+  if (best) {
+    person = person ? { ...best, x: lerp(person.x, best.x, .5), y: lerp(person.y, best.y, .5) } : best;
+    measureMotion(best, now);
+    seenFrames++; lastSeen = now;
+  } else {
+    seenFrames = 0;
+  }
+  lastDetect = now;
+  if (debugOn) drawDebug(res);
+}
+
+function resetPerson() {
+  person = null; torso = null; torsoHist = []; speed = 0; moving = true; seenFrames = 0;
+}
+
+// ───────────────────────── 상황 흐름 (상태 머신) ─────────────────────────
+//  idle ─입장→ track ─멈춤 유지→ celebrate ─→ done(두리번) ─퇴장→ idle          (상황 1)
+//                 └─계속 움직임→ warn ─멈춤 유지→ done                        (상황 2)
+//                                   └─계속 움직임→ angry ─멈춤 유지→ done      (상황 3)
+//                                                     └─계속 움직임→ rage      (상황 4)
+function updateState(now, dt) {
+  const ms = dt * 1000;
+  if (forced) {
+    if (["warn", "angry", "rage"].includes(state)) moveMs += ms;
+    return;
+  }
+  if (person && now - lastSeen > CONFIG.leaveMs) {
+    resetPerson();
+    if (state !== "idle") setState("idle", now);
+    return;
+  }
+  switch (state) {
+    case "idle":
+      if (person && now - lastSeen > 500) resetPerson();
+      if (seenFrames >= CONFIG.enterFrames) setState("track", now);
+      break;
+    case "track": case "warn": case "angry": case "rage": {
+      if (moving) { moveMs += ms; stillMs = 0; } else stillMs += ms;
+      if (stillMs >= CONFIG.stillGoalMs) { setState(state === "track" ? "celebrate" : "done", now); break; }
+      if (state === "track" && moveMs >= CONFIG.warnAfterMs) setState("warn", now);
+      else if (state === "warn" && moveMs >= CONFIG.angryAfterMs) setState("angry", now);
+      else if (state === "angry" && moveMs >= CONFIG.rageAfterMs) setState("rage", now);
+      break;
+    }
+    case "celebrate":
+      if (now - stateStart > CONFIG.celebrateMs) setState("done", now);
+      break;
+    case "done":
+      if (!person || now - stateStart > CONFIG.doneMaxMs) { resetPerson(); setState("idle", now); }
+      break;
+  }
+}
+
+function targetColor(now) {
+  const stillP = clamp(stillMs / CONFIG.stillGoalMs, 0, 1);
+  let c;
+  switch (state) {
+    case "warn":  c = mixRGB(COLOR.yellow, COLOR.amber, moveMs / CONFIG.angryAfterMs); break;
+    case "angry": c = mixRGB(COLOR.red, COLOR.red2, moveMs / CONFIG.rageAfterMs); break;
+    case "rage": {
+      const g = rageShown;
+      c = g < 0.5 ? mixRGB(COLOR.red2, COLOR.blood, g * 2) : mixRGB(COLOR.blood, COLOR.dark, (g - 0.5) * 2);
+      const beat = Math.pow(Math.max(0, Math.sin(now / 1000 * Math.PI * (1.4 + g * 1.6))), 6);
+      c = mixRGB(c, [255, 20, 10], beat * (0.15 + g * 0.25));
+      break;
+    }
+    default: return COLOR.blue;
+  }
+  return mixRGB(c, COLOR.blue, stillP * 0.75);
+}
+
+// ───────────────────────── 컨페티 ─────────────────────────
+const CONFETTI_COLORS = ["#5ff0ff", "#5ff0ff", "#5ff0ff", "#a6f8ff", "#ffffff", "#ffd84d", "#ff7eb6"];
+let confetti = [];
+function spawnConfetto(x, y, vx, vy) {
+  const u = Math.min(W, H) / 900;
+  const r = Math.random();
+  confetti.push({
+    x, y, vx, vy,
+    kind: r < 0.45 ? "capsule" : r < 0.75 ? "dot" : "ribbon",
+    color: pick(CONFETTI_COLORS),
+    size: rand(0.8, 1.3) * u,
+    rot: rand(0, Math.PI * 2), spin: rand(-6, 6),
+    flip: rand(0, Math.PI * 2), flipSpeed: rand(5, 11),
+    wob: rand(0, Math.PI * 2), wobSpeed: rand(2, 4), wobAmp: rand(20, 60) * u,
+  });
+}
+function burstConfetti() {
+  const u = Math.min(W, H) / 900;
+  for (const side of [-1, 1]) {
+    for (let i = 0; i < 90; i++) {
+      const ang = Math.PI / 2 - side * rand(0.25, 1.05);
+      const sp = rand(500, 1300) * u;
+      spawnConfetto(side < 0 ? rand(-20, 40) : W - rand(-20, 40), rand(-30, 10), Math.cos(ang) * sp, Math.sin(ang) * sp);
+    }
+  }
+  for (let i = 0; i < 110; i++) spawnConfetto(rand(0, W), rand(-H * 0.3, -10), rand(-80, 80) * u, rand(100, 500) * u);
+}
+function updateConfetti(dt, now) {
+  if (state === "celebrate" && now - stateStart < CONFIG.celebrateMs - 1500) {
+    const n = Math.floor(dt * 55 + Math.random());
+    for (let i = 0; i < n; i++) spawnConfetto(rand(0, W), -20, rand(-40, 40), rand(80, 200));
+  }
+  const g = 650 * Math.min(W, H) / 900;
+  for (const p of confetti) {
+    p.vy += g * dt;
+    const drag = Math.exp(-dt * 2.2);
+    p.vx *= drag; p.vy *= drag;
+    p.wob += p.wobSpeed * dt;
+    p.x += (p.vx + Math.sin(p.wob) * p.wobAmp) * dt;
+    p.y += p.vy * dt;
+    p.rot += p.spin * dt; p.flip += p.flipSpeed * dt;
+  }
+  confetti = confetti.filter(p => p.y < H + 60);
+}
+function drawConfetti() {
+  ctx.shadowColor = "transparent";
+  for (const p of confetti) {
+    ctx.save();
+    ctx.translate(p.x, p.y); ctx.rotate(p.rot);
+    ctx.fillStyle = ctx.strokeStyle = p.color;
+    const s = p.size;
+    if (p.kind === "capsule") {
+      ctx.scale(1, Math.max(Math.abs(Math.cos(p.flip)), 0.35));
+      ctx.lineWidth = 15 * s; ctx.lineCap = "round";
+      ctx.beginPath(); ctx.moveTo(-14 * s, 4 * s); ctx.quadraticCurveTo(0, -6 * s, 14 * s, 4 * s); ctx.stroke();
+    } else if (p.kind === "dot") {
+      ctx.beginPath(); ctx.arc(0, 0, 9 * s, 0, Math.PI * 2); ctx.fill();
+    } else {
+      ctx.scale(1, Math.cos(p.flip));
+      ctx.fillRect(-7 * s, -11 * s, 14 * s, 22 * s);
+    }
+    ctx.restore();
+  }
+}
+
+// ───────────────────────── 그리기 ─────────────────────────
+function star(x, y, s) {             // 네 갈래 반짝이 ✦
+  if (s <= 0.5) return;
+  ctx.beginPath();
+  ctx.moveTo(x, y - s);
+  ctx.quadraticCurveTo(x, y, x + s, y);
+  ctx.quadraticCurveTo(x, y, x, y + s);
+  ctx.quadraticCurveTo(x, y, x - s, y);
+  ctx.quadraticCurveTo(x, y, x, y - s);
+  ctx.fill();
+}
+
+function drawBrow(x0, y0, R, b, dy, dang) {
+  const [bx, by, len, ang, curve] = b;
+  const x = x0 + bx * R, y = y0 + (by + dy) * R, h = len * R / 2;
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(ang + dang);
+  ctx.beginPath();
+  ctx.moveTo(-h, 0);
+  ctx.quadraticCurveTo(0, -curve * R * 2, h, 0);
+  ctx.lineWidth = BROW_THICK * R;
+  ctx.stroke();
+  ctx.restore();
+}
+
+// 눈: 흰 링 + 링 안쪽 구멍(=동공)이 시선 방향으로 움직임. 반짝이·눈꺼풀 포함
+function drawEye(x, y, eR, thickR, o, now, phase) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(o.sx, Math.max(o.open, 0.08));
+
+  if (o.arc < 0.985) {                       // 웃는 눈 (∩)
+    ctx.beginPath();
+    const span = lerp(Math.PI, Math.PI * 2, o.arc);
+    const start = -Math.PI / 2 - span / 2;
+    ctx.arc(0, 0, eR, start, start + span);
+    ctx.restore();
+    ctx.lineWidth = EYE_THICK * thickR;
+    ctx.stroke();
+    return;
+  }
+
+  const Ro = eR + EYE_THICK * thickR / 2;
+  const Ri = Math.max(0, eR - EYE_THICK * thickR / 2) * o.pScale;
+  const lidY = -Ro + o.lid * 2 * Ro;
+
+  if (o.lid > 0.01) {                        // 눈꺼풀: 위에서 내려와 눈을 잘라냄
+    ctx.save();
+    ctx.rotate(o.lidTilt);
+    ctx.beginPath(); ctx.rect(-Ro * 3, lidY, Ro * 6, Ro * 6); ctx.clip();
+    ctx.rotate(-o.lidTilt);
+  }
+
+  const maxOff = Math.max(0, Ro - Ri - EYE_THICK * thickR * 0.32);
+  const hx = o.px * maxOff, hy = o.py * maxOff;
+  ctx.beginPath();
+  ctx.arc(0, 0, Ro, 0, Math.PI * 2);
+  ctx.moveTo(hx + Ri, hy);
+  ctx.arc(hx, hy, Ri, 0, Math.PI * 2);
+  ctx.fill("evenodd");
+
+  if (o.sparkle > 0.02 && Ri > 2) {          // 동공 속 반짝반짝 ✦
+    const tw = 0.75 + 0.25 * Math.sin(now / 140 + phase);
+    const tw2 = 0.6 + 0.4 * Math.sin(now / 110 + phase + 2);
+    ctx.shadowColor = "transparent";
+    star(hx - Ri * 0.28, hy - Ri * 0.25, Ri * 0.55 * o.sparkle * tw);
+    star(hx + Ri * 0.38, hy + Ri * 0.3, Ri * 0.28 * o.sparkle * tw2);
+  }
+
+  if (o.lid > 0.01) {
+    ctx.restore();
+    // 눈꺼풀 선
+    ctx.rotate(o.lidTilt);
+    const half = Math.sqrt(Math.max(0, Ro * Ro - lidY * lidY));
+    if (half > 1) {
+      ctx.beginPath(); ctx.moveTo(-half, lidY); ctx.lineTo(half, lidY);
+      ctx.lineWidth = EYE_THICK * thickR * 0.55; ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+const TWINKLES = Array.from({ length: 10 }, (_, i) => ({ a: (i / 10) * Math.PI * 2 + rand(-.2, .2), r: rand(4.2, 6), ph: rand(0, 6), s: rand(0.25, 0.45) }));
+
+function render(now) {
+  const base = Math.min(W, H) * CONFIG.faceScale;
+  const fillMul = Math.max(W / 4.4, H / 3.0) / base;
+  const grow = Math.pow(rageShown, 2.2);
+  const R = base * lerp(1, fillMul, grow);
+  const follow = 1 - grow * 0.9;
+
+  const margin = Math.min(W, H) * CONFIG.edgeMargin;
+  const rangeX = Math.max(0, W / 2 - 3.3 * R - margin) * follow;
+  const rangeY = Math.max(0, (H - 2 * margin - 4.4 * R) / 2) * follow;
+  const gx = gaze.x.x, gy = gaze.y.x;
+  let cx = W / 2 + gx * rangeX + mods.ox * W;
+  let cy = H / 2 + R * lerp(0.7, 0.35, grow) + gy * rangeY + mods.oy * H;
+  if (mods.shake > 0.001) { cx += rand(-1, 1) * base * mods.shake * 2; cy += rand(-1, 1) * base * mods.shake; }
+
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.fillStyle = rgb(bg); ctx.fillRect(0, 0, W, H);
+  if (rageShown > 0.01) {
+    const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.2, W / 2, H / 2, Math.max(W, H) * 0.75);
+    v.addColorStop(0, "rgba(0,0,0,0)");
+    v.addColorStop(1, `rgba(20,0,0,${0.7 * rageShown})`);
+    ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
+  }
+  drawConfetti();
+
+  // 얼굴 좌표계: 눈 중심을 원점으로, 기울기·찌그러짐 적용
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(mods.tilt);
+  ctx.scale(mods.sx, mods.sy);
+
+  ctx.strokeStyle = ctx.fillStyle = CONFIG.fg; ctx.lineCap = "round";
+  const dark = bg.map(v => v * 0.35);
+  ctx.shadowColor = `rgba(${dark.map(Math.round).join(",")},.45)`;
+  ctx.shadowBlur = base * 0.25; ctx.shadowOffsetY = base * 0.08;
+
+  const turn = clamp(gx, -1, 1) * follow;
+  const gap = EYE_GAP * R * (1 - Math.abs(turn) * 0.12);
+  const sL = 1 - turn * 0.08, sR = 1 + turn * 0.08;
+  const squash = 1 - Math.abs(turn) * 0.1;
+  const eyeY = expr.eyeY * R;
+  const eR = R * expr.eyeScale * mods.eyeMul;
+  const o = { sx: squash, open: (1 - blink) * (1 - mods.close * 0.92), arc: expr.eyeArc, px: mods.px, py: mods.py, pScale: mods.pScale, lid: mods.lid, sparkle: mods.sparkle };
+
+  drawEye(-gap, eyeY, eR * sL, R, { ...o, lidTilt: mods.lidTilt }, now, 0);
+  drawEye(gap, eyeY, eR * sR, R, { ...o, lidTilt: -mods.lidTilt }, now, 1.7);
+
+  // 눈썹: 2차 모션(살짝 늦게 따라옴) + 눈이 커지면 같이 올라감
+  ctx.strokeStyle = ctx.fillStyle = CONFIG.fg;
+  const bdx = clamp((browLag.x.x - gx) * rangeX * 0.25, -R * 0.6, R * 0.6);
+  const bdy = clamp((browLag.y.x - gy) * rangeY * 0.25, -R * 0.4, R * 0.4) - blink * R * 0.25 - (mods.eyeMul - 1) * R * 1.4;
+  drawBrow(-gap + bdx, bdy, R * sL, expr.L, mods.bL, mods.baL);
+  drawBrow(gap + bdx, bdy, R * sR, expr.R, mods.bR, mods.baR);
+
+  // 환호: 얼굴 주변 반짝이
+  if (state === "celebrate" && now - stateStart > 300) {
+    ctx.shadowColor = "transparent";
+    for (const tw of TWINKLES) {
+      const k = Math.max(0, Math.sin(now / 260 + tw.ph));
+      ctx.fillStyle = tw.ph > 3 ? "#5ff0ff" : "#ffffff";
+      star(Math.cos(tw.a) * tw.r * R, Math.sin(tw.a) * tw.r * R * 0.7 - R * 0.6, tw.s * R * k);
+    }
+  }
+  ctx.restore();
+}
+
+// ───────────────────────── 메인 루프 ─────────────────────────
+let last = performance.now();
+function loop(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 20); last = now;
+  detect(now);
+  updateState(now, dt);
+
+  const T = { ...MOD0 };
+  const following = ["track", "warn", "angry", "rage", "celebrate"].includes(state) && person;
+  if (following) {
+    const sign = CONFIG.mirror ? -1 : 1;
+    gazeTarget = {
+      x: clamp(sign * (person.x - 0.5) * 2 * CONFIG.trackGainX, -1, 1),
+      y: clamp((person.y - CONFIG.trackCenterY) * 2 * CONFIG.trackGainY, -1, 1),
+    };
+    stateMods(now, T);
+  } else if (state === "idle" || state === "done") {
+    idleAct(now, T);
+  } else {
+    gazeTarget = { x: 0, y: 0 };
+    stateMods(now, T);
+  }
+
+  spring(gaze.x, gazeTarget.x, springKD[0], springKD[1], dt);
+  spring(gaze.y, gazeTarget.y, springKD[0], springKD[1], dt);
+  spring(browLag.x, gaze.x.x, 90, 12, dt);
+  spring(browLag.y, gaze.y.x, 90, 12, dt);
+
+  const rate = T._rate || 9;
+  const mt = 1 - Math.exp(-dt * rate);
+  for (const k in MOD0) mods[k] = lerp(mods[k], T[k], mt);
+
+  // 깜빡임 (환호·격노·졸음 중에는 깜빡이지 않음)
+  const canBlink = state !== "celebrate" && state !== "rage" && mods.lid < 0.3 && mods.close < 0.2;
+  if (blinkStart < 0 && now > nextBlink && canBlink) blinkStart = now;
+  if (blinkStart >= 0) {
+    const t = (now - blinkStart) / 180;
+    blink = t < 0.5 ? t * 2 : Math.max(0, 2 - t * 2);
+    if (t >= 1) { blink = 0; blinkStart = -1; nextBlink = now + (Math.random() < .2 ? 220 : rand(2200, 5500)); }
+  }
+
+  // 표정 보간 (환호는 '반짝 놀람' 뒤에 웃는 눈으로)
+  const ename = state === "celebrate" && now - stateStart < 450 ? "brooding" : STATE_EXPR[state];
+  const target = EXPR[ename];
+  const t = 1 - Math.exp(-dt * 10);
+  for (const side of ["L", "R"]) expr[side] = expr[side].map((v, i) => lerp(v, target[side][i], t));
+  for (const key of ["eyeArc", "eyeY", "eyeScale"]) expr[key] = lerp(expr[key], target[key], t);
+
+  const rageTarget = state === "rage" ? clamp(moveMs / CONFIG.rageGrowMs, 0, 1) : 0;
+  rageShown = lerp(rageShown, rageTarget, 1 - Math.exp(-dt * (state === "rage" ? 3 : 2)));
+
+  const tc = targetColor(now);
+  const toward = state === "rage" ? 6 : ["warn", "angry"].includes(state) ? 3 : 1.5;
+  bg = mixRGB(bg, tc, 1 - Math.exp(-dt * toward));
+
+  updateConfetti(dt, now);
+  render(now);
+  if (debugOn) updateDebugText();
+  requestAnimationFrame(loop);
+}
+
+// ───────────────────────── 디버그 화면 (D 키) ─────────────────────────
+let debugOn = false;
+const debugEl = document.getElementById("debug");
+const barStill = document.getElementById("barStill"), barMove = document.getElementById("barMove");
+function drawDebug(res) {
+  camCtx.save();
+  if (CONFIG.mirror) { camCtx.translate(320, 0); camCtx.scale(-1, 1); }
+  camCtx.drawImage(video, 0, 0, 320, 240);
+  camCtx.fillStyle = "#0f0";
+  for (const lm of res.landmarks) for (const p of lm) camCtx.fillRect(p.x * 320 - 1.5, p.y * 240 - 1.5, 3, 3);
+  for (const p of people) { camCtx.strokeStyle = "rgba(255,255,255,.5)"; camCtx.lineWidth = 2; camCtx.beginPath(); camCtx.arc(p.x * 320, p.y * 240, 10, 0, 7); camCtx.stroke(); }
+  if (person) { camCtx.strokeStyle = "#ff0"; camCtx.lineWidth = 3; camCtx.beginPath(); camCtx.arc(person.x * 320, person.y * 240, 14, 0, 7); camCtx.stroke(); }
+  camCtx.restore();
+}
+function updateDebugText() {
+  const next = { track: CONFIG.warnAfterMs, warn: CONFIG.angryAfterMs, angry: CONFIG.rageAfterMs, rage: CONFIG.rageGrowMs }[state];
+  const idleish = state === "idle" || state === "done";
+  info.innerHTML =
+    `상태: <b>${STATE_LABEL[state]}</b>${idleish ? ` · 연기: ${ACT_LABEL[act.name]}` : ""}${forced ? " (테스트 고정)" : ""}<br>` +
+    `인식 ${people.length}명 · 대상 ${person ? (performance.now() - lastSeen < 300 ? "고정 중" : "놓침(찾는 중)") : "없음"} · 판단: <b>${moving ? "움직임" : "멈춤"}</b> · 속도 ${speed.toFixed(2)}<br>` +
+    `반전 ${CONFIG.mirror ? "ON" : "OFF"}`;
+  barStill.style.width = (clamp(stillMs / CONFIG.stillGoalMs, 0, 1) * 100) + "%";
+  barMove.style.width = (next ? clamp(moveMs / next, 0, 1) * 100 : 0) + "%";
+}
+
+addEventListener("keydown", (e) => {
+  // 한글/영문 자판 모두 동작: 물리 키 위치(e.code) → 한글 자모(e.key) → 영문(e.key)
+  const HANGUL = { "ㅇ": "d", "ㅡ": "m", "ㄹ": "f" };
+  const fromCode = (e.code || "").replace(/^(Key|Digit|Numpad)/, "").toLowerCase();
+  const k = /^[a-z0-9]$/.test(fromCode) ? fromCode : (HANGUL[e.key] || (e.key || "").toLowerCase());
+  if (e.isComposing) e.preventDefault();
+  const now = performance.now();
+  if (k === "d") { debugOn = !debugOn; debugEl.style.display = debugOn ? "block" : "none"; document.body.style.cursor = debugOn ? "default" : "none"; }
+  if (k === "m") CONFIG.mirror = !CONFIG.mirror;
+  if (k === "f") document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  // 테스트: 1~5 = 상황 단계, 6~9 = 대기 연기 미리보기, 0 = 자동
+  const map = { "1": "idle", "2": "warn", "3": "angry", "4": "rage", "5": "celebrate" };
+  if (k in map) { forced = true; setState(map[k], now); }
+  const acts = { "6": "peek", "7": "doze", "8": pick(["skeptic", "tilt"]), "9": pick(["wonder", "hop", "spin"]) };
+  if (k in acts) { forced = false; resetPerson(); state = "idle"; stateStart = now; moveMs = stillMs = 0; startAct(acts[k], now); }
+  if (k === "0") { forced = false; resetPerson(); setState("idle", now); }
+});
+
+// ───────────────────────── 시작 ─────────────────────────
+window.__debug = () => ({ state, act: act.name, mods: { ...mods }, rageShown });
+setState("idle", performance.now());
+requestAnimationFrame(loop);
+try {
+  msg.textContent = "인식 모델 불러오는 중…";
+  await initVision();
+  window.__visionReady = true;
+  msg.textContent = "카메라 연결 중…";
+  await initCamera();
+  msg.textContent = "";
+} catch (err) {
+  console.error(err);
+  msg.textContent = "카메라를 사용할 수 없습니다 — 두리번거림만 동작합니다. (" + err.name + ")";
+  setTimeout(() => (msg.textContent = ""), 6000);
+}
+</script>
+</body>
+</html>
