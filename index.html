@@ -55,37 +55,34 @@ const CONFIG = {
 
   // ── 시간 (ms) ──
   stillGoalMs: 1500,        // 이만큼 멈춰 있으면 목표 달성
-  warnAfterMs: 2500,        // 따라보는 중 이만큼 움직이면 → 걱정(노랑)
-  angryAfterMs: 2500,       // 걱정 중 이만큼 더 움직이면 → 화남(빨강)
-  rageAfterMs: 2000,        // 화남 중 이만큼 더 움직이면 → 격노(점점 커짐)
-  rageGrowMs: 8000,         // 격노 시작 후 화면을 꽉 채우기까지
+  warnAfterMs: 2500,        // 따라보는 중 이만큼 움직이면 → 걱정
+  angryAfterMs: 2500,       // 걱정 중 이만큼 더 움직이면 → 화남
+  rageAfterMs: 2000,        // 화남 중 이만큼 더 움직이면 → 화남 + 점점 커짐
+  rageGrowMs: 8000,         // 커지기 시작해서 화면을 꽉 채우기까지 (꽉 차면 크기는 멈추고 떨림만 계속)
   celebrateMs: 5500,        // 환호 지속 시간
-  doneMaxMs: 45000,         // 목표 달성 후, 사람이 계속 있어도 이 시간 지나면 다시 반응
+  ignoreMaxMs: 45000,       // 한 단계를 마친 감상자는 이 시간 동안 무시하고 새 감상자를 찾음
 };
 
-// 배경색 (RGB)
-const COLOR = {
-  blue:   [5, 99, 201],
-  yellow: [245, 184, 0],
-  amber:  [240, 138, 0],
-  red:    [226, 35, 26],
-  red2:   [185, 14, 14],
-  blood:  [110, 0, 4],
-  dark:   [38, 0, 2],
-};
+// 배경색 (RGB) — 모든 표정에서 동일하게 유지
+const BG = [5, 99, 201];
 
 // ───────────────────────── 표정 정의 ─────────────────────────
 // 단위: 눈 반지름(R). 눈썹 = [x 오프셋, y 오프셋, 길이, 기울기(rad, +는 오른쪽 끝이 아래), 휘어짐(+는 위로 볼록)]
 const EXPR = {
   brooding:    { L: [0, -2.45, 2.35, 0.00, 0.16],   R: [0.05, -1.97, 2.25, 0.02, 0.0],  eyeArc: 1, eyeY: 0,   eyeScale: 1 },
-  aware:       { L: [-0.45, -2.4, 1.7, -0.48, 0.15], R: [0.45, -2.4, 1.7, 0.48, 0.15],   eyeArc: 1, eyeY: 0,   eyeScale: 1.04 },
+  aware:       { L: [-0.3, -2.25, 1.8, -0.4, 0.12],  R: [0.3, -2.25, 1.8, 0.4, 0.12],    eyeArc: 1, eyeY: 0,   eyeScale: 1.02 },
   angry:       { L: [0.12, -2.28, 1.85, 0.39, 0],    R: [-0.12, -2.28, 1.85, -0.39, 0],  eyeArc: 1, eyeY: 0,   eyeScale: 1.02 },
   celebrating: { L: [-0.93, -1.95, 1.45, -0.6, 0.12], R: [0.93, -1.95, 1.45, 0.6, 0.12], eyeArc: 0, eyeY: 0.3, eyeScale: 1.05 },
 };
 const EYE_GAP = 1.6, EYE_THICK = 0.68, BROW_THICK = 0.58;
 
-const STATE_EXPR = { idle: "brooding", track: "brooding", done: "brooding", warn: "aware", angry: "angry", rage: "angry", celebrate: "celebrating" };
-const STATE_LABEL = { idle: "두리번거림", track: "따라보기", warn: "걱정(경고)", angry: "화남", rage: "격노(커짐)", celebrate: "환호", done: "목표 달성 → 두리번거림" };
+// 감정별 눈매: 기본 링 눈·눈썹 구조는 그대로, 눈꺼풀(윗선)의 높이·기울기로만 눈매를 바꿈
+// lid = 눈꺼풀이 내려온 정도(0~1), tilt = 기울기(rad, + = 코 쪽이 내려감 → 노려봄, - = 바깥 눈꼬리가 처짐 → 걱정)
+// 눈썹도 같은 방향으로 기울어 있어 눈썹–눈매가 한 세트로 읽힘 (EXPR.aware / EXPR.angry)
+const LID = { worry: { lid: 0.26, tilt: -0.34 }, angry: { lid: 0.32, tilt: 0.36 }, rage: { lid: 0.36, tilt: 0.42 } };
+
+const STATE_EXPR = { idle: "brooding", track: "brooding", warn: "aware", angry: "angry", rage: "angry", celebrate: "celebrating" };
+const STATE_LABEL = { idle: "두리번거림", track: "따라보기", warn: "걱정", angry: "화남", rage: "화남(커짐)", celebrate: "환호" };
 const ACT_LABEL = { look: "두리번", peek: "가장자리에서 빼꼼", doze: "꾸벅 졸다 화들짝", skeptic: "실눈 곁눈질", wonder: "반짝 눈", tilt: "갸웃", hop: "통통 이동", spin: "눈 굴리기" };
 
 // ───────────────────────── 캔버스 ─────────────────────────
@@ -140,7 +137,7 @@ let gazeTarget = { x: 0, y: 0 };
 let springKD = [140, 17];
 let expr = structuredClone(EXPR.brooding);
 let blink = 0, nextBlink = performance.now() + 2000, blinkStart = -1;
-let bg = [...COLOR.blue];
+const bg = BG;
 let rageShown = 0;
 
 let state = "idle", stateStart = 0;
@@ -150,7 +147,15 @@ let forced = false;
 function setState(s, now) {
   state = s; stateStart = now; moveMs = 0; stillMs = 0;
   if (s === "celebrate") burstConfetti();
-  if (s === "idle" || s === "done") startAct("look", now, rand(2500, 4000));
+  if (s === "idle") startAct("look", now, rand(2500, 4000));
+}
+
+// 한 단계를 마침 → 지금 감상자는 '반응 끝난 사람'으로 기억해 두고 무시,
+// 두리번거리며 새 감상자를 찾음 (새 사람이 식별되면 따라보기부터 다시 진행)
+function finishVisitor(now) {
+  if (person) { ignored = { ...person }; ignoredSeen = lastSeen; ignoredSince = now; }
+  resetPerson();
+  setState("idle", now);
 }
 
 // ───────────────────────── 대기 중 연기 (두리번거림 상태의 다양한 동작) ─────────────────────────
@@ -317,32 +322,40 @@ function stateMods(now, T) {
       break;
     }
     case "warn": {
+      // 1) 걱정: 눈꼬리가 처진 눈, 살짝 불안하게 떨림
       const p = clamp(moveMs / CONFIG.angryAfterMs, 0, 1);
-      T.eyeMul = 1.08 + 0.16 * p;          // 눈이 점점 커지고
-      T.pScale = 0.78 - 0.28 * p;          // 동공은 점점 작아짐 (불안)
-      T.bL = T.bR = -0.2 - 0.25 * p;
-      T.shake = 0.008 + 0.02 * p;
-      T.px *= 0.5; T.py = T.py * 0.5 - 0.1;
+      T.lid = LID.worry.lid + 0.04 * p; T.lidTilt = LID.worry.tilt - 0.06 * p;   // 바깥 눈꼬리가 처진 눈매
+      T.pScale = 0.85 - 0.15 * p;          // 동공이 조금씩 작아짐 (불안)
+      T.bL = T.bR = -0.1 - 0.15 * p;       // 눈썹이 걱정스럽게 들림
+      T.shake = 0.006 + 0.012 * p;
+      T.px *= 0.6; T.py = T.py * 0.4 + 0.2;
+      T._rate = 7;
       break;
     }
     case "angry": {
+      // 2) 화남: 노려보는 눈, 씩씩거리며 떨림
       const p = clamp(moveMs / CONFIG.rageAfterMs, 0, 1);
       const beat = Math.pow(Math.max(0, Math.sin(sec * Math.PI * 2.2)), 8);   // 씩씩
-      T.lid = 0.3 + 0.08 * p; T.lidTilt = 0.38;   // 눈꺼풀이 안쪽으로 내려와 노려봄
-      T.pScale = 0.62 - 0.12 * p;
-      T.eyeMul = 1.02 + 0.05 * beat;
-      T.bL = T.bR = 0.12 + 0.1 * beat;
+      T.lid = LID.angry.lid + 0.04 * p; T.lidTilt = LID.angry.tilt;   // 코 쪽이 내려온 노려보는 눈매
+      T.pScale = 0.68 - 0.1 * p;
+      T.eyeMul = 1 + 0.04 * beat;
+      T.bL = T.bR = 0.12 + 0.1 * beat;     // 눈썹이 눈꺼풀 쪽으로 눌림
+      T.py = T.py * 0.5 + 0.15;
       T.shake = 0.018 + 0.015 * p + beat * 0.02;
+      T._rate = 7;
       break;
     }
     case "rage": {
+      // 3) 화남 + 점점 커짐: 화면에 꽉 차면 크기는 멈추고, 부들부들 떨림은 계속
       const g = rageShown;
       const beat = Math.pow(Math.max(0, Math.sin(sec * Math.PI * (1.4 + g * 1.6))), 6);
-      T.lid = 0.36; T.lidTilt = 0.42;
-      T.pScale = 0.45 - 0.2 * g;           // 동공이 점점 바늘처럼
-      T.eyeMul = 1.03 + 0.06 * beat;
+      T.lid = LID.rage.lid; T.lidTilt = LID.rage.tilt;
+      T.pScale = 0.55 - 0.1 * g;
+      T.eyeMul = 1 + 0.03 * beat;
       T.bL = T.bR = 0.15 + 0.1 * beat;
-      T.shake = 0.025 + 0.04 * g + beat * 0.02;
+      T.py = T.py * 0.5 + 0.15;
+      T.shake = 0.03 + 0.03 * g + beat * 0.02;
+      T._rate = 7;
       break;
     }
     case "celebrate": {
@@ -366,6 +379,7 @@ const camCv = document.getElementById("cam"), camCtx = camCv.getContext("2d");
 const info = document.getElementById("info");
 let landmarker = null, lastVideoTime = -1, lastDetect = 0;
 let seenFrames = 0, lastSeen = -1e9, person = null, people = [];
+let ignored = null, ignoredSeen = -1e9, ignoredSince = 0;   // 반응을 마친 감상자 (계속 위치만 추적해서 무시)
 let torso = null, torsoHist = [], speed = 0, moving = true;
 
 async function initVision() {
@@ -415,27 +429,38 @@ function measureMotion(p, now) {
   else if (!moving && speed > CONFIG.moveSpeed) moving = true;
 }
 
+// 직전 위치 근처 + 비슷한 크기의 사람을 같은 사람으로 인정
+function matchNear(ref, seenAt, list, now) {
+  const lostSec = (now - seenAt) / 1000;
+  const gate = Math.max(0.1, ref.size * CONFIG.lockRadius) + Math.min(lostSec, 1) * 0.25;
+  let best = null, bd = Infinity;
+  for (const p of list) {
+    const ratio = p.size / ref.size;
+    if (ratio < 0.55 - lostSec * 0.1 || ratio > 1.8 + lostSec * 0.2) continue;
+    const d = Math.hypot(p.tx - ref.tx, p.ty - ref.ty);
+    if (d < gate && d < bd) { bd = d; best = p; }
+  }
+  return best;
+}
+
 function detect(now) {
   if (!landmarker || video.readyState < 2 || video.currentTime === lastVideoTime) return;
   lastVideoTime = video.currentTime;
   const res = landmarker.detectForVideo(video, now);
   people = res.landmarks.map(summarize).filter(p => p.size >= CONFIG.minPersonSize);
 
-  // 대상 고정: 한 번 식별된 감상자만 계속 따라감
-  let best = null;
-  if (person) {
-    const lostSec = (now - lastSeen) / 1000;
-    const gate = Math.max(0.1, person.size * CONFIG.lockRadius) + Math.min(lostSec, 1) * 0.25;
-    let bd = Infinity;
-    for (const p of people) {
-      const ratio = p.size / person.size;
-      if (ratio < 0.55 - lostSec * 0.1 || ratio > 1.8 + lostSec * 0.2) continue;
-      const d = Math.hypot(p.tx - person.tx, p.ty - person.ty);
-      if (d < gate && d < bd) { bd = d; best = p; }
-    }
-  } else if (people.length) {
-    best = people.reduce((a, b) => (b.size > a.size ? b : a));
+  // 반응을 마친 감상자: 위치만 계속 따라가며 후보에서 제외 (사라지거나 시간이 지나면 잊음)
+  let pool = people;
+  if (ignored) {
+    const m = matchNear(ignored, ignoredSeen, pool, now);
+    if (m) { ignored = m; ignoredSeen = now; pool = pool.filter(p => p !== m); }
+    if (now - ignoredSeen > CONFIG.leaveMs || now - ignoredSince > CONFIG.ignoreMaxMs) ignored = null;
   }
+
+  // 대상 고정: 한 번 식별된 감상자만 계속 따라감 (없으면 새 사람 중 가장 가까운 사람)
+  let best = null;
+  if (person) best = matchNear(person, lastSeen, pool, now);
+  else if (pool.length) best = pool.reduce((a, b) => (b.size > a.size ? b : a));
 
   if (best) {
     person = person ? { ...best, x: lerp(person.x, best.x, .5), y: lerp(person.y, best.y, .5) } : best;
@@ -453,10 +478,11 @@ function resetPerson() {
 }
 
 // ───────────────────────── 상황 흐름 (상태 머신) ─────────────────────────
-//  idle ─입장→ track ─멈춤 유지→ celebrate ─→ done(두리번) ─퇴장→ idle          (상황 1)
-//                 └─계속 움직임→ warn ─멈춤 유지→ done                        (상황 2)
-//                                   └─계속 움직임→ angry ─멈춤 유지→ done      (상황 3)
-//                                                     └─계속 움직임→ rage      (상황 4)
+//  idle ─입장→ track ─멈춤 유지→ celebrate ─→ 마침                           (상황 1)
+//                 └─계속 움직임→ warn ─멈춤 유지→ 마침                        (상황 2)
+//                                   └─계속 움직임→ angry ─멈춤 유지→ 마침      (상황 3)
+//                                                     └─계속 움직임→ rage ─멈춤 유지→ 마침 (상황 4)
+//  마침 = 지금 감상자는 무시 → idle(두리번거림)로 돌아가 새 감상자를 찾음 → 찾으면 track부터 반복
 function updateState(now, dt) {
   const ms = dt * 1000;
   if (forced) {
@@ -475,37 +501,16 @@ function updateState(now, dt) {
       break;
     case "track": case "warn": case "angry": case "rage": {
       if (moving) { moveMs += ms; stillMs = 0; } else stillMs += ms;
-      if (stillMs >= CONFIG.stillGoalMs) { setState(state === "track" ? "celebrate" : "done", now); break; }
+      if (stillMs >= CONFIG.stillGoalMs) { state === "track" ? setState("celebrate", now) : finishVisitor(now); break; }
       if (state === "track" && moveMs >= CONFIG.warnAfterMs) setState("warn", now);
       else if (state === "warn" && moveMs >= CONFIG.angryAfterMs) setState("angry", now);
       else if (state === "angry" && moveMs >= CONFIG.rageAfterMs) setState("rage", now);
       break;
     }
     case "celebrate":
-      if (now - stateStart > CONFIG.celebrateMs) setState("done", now);
-      break;
-    case "done":
-      if (!person || now - stateStart > CONFIG.doneMaxMs) { resetPerson(); setState("idle", now); }
+      if (now - stateStart > CONFIG.celebrateMs) finishVisitor(now);
       break;
   }
-}
-
-function targetColor(now) {
-  const stillP = clamp(stillMs / CONFIG.stillGoalMs, 0, 1);
-  let c;
-  switch (state) {
-    case "warn":  c = mixRGB(COLOR.yellow, COLOR.amber, moveMs / CONFIG.angryAfterMs); break;
-    case "angry": c = mixRGB(COLOR.red, COLOR.red2, moveMs / CONFIG.rageAfterMs); break;
-    case "rage": {
-      const g = rageShown;
-      c = g < 0.5 ? mixRGB(COLOR.red2, COLOR.blood, g * 2) : mixRGB(COLOR.blood, COLOR.dark, (g - 0.5) * 2);
-      const beat = Math.pow(Math.max(0, Math.sin(now / 1000 * Math.PI * (1.4 + g * 1.6))), 6);
-      c = mixRGB(c, [255, 20, 10], beat * (0.15 + g * 0.25));
-      break;
-    }
-    default: return COLOR.blue;
-  }
-  return mixRGB(c, COLOR.blue, stillP * 0.75);
 }
 
 // ───────────────────────── 컨페티 ─────────────────────────
@@ -655,31 +660,30 @@ function drawEye(x, y, eR, thickR, o, now, phase) {
   ctx.restore();
 }
 
-const TWINKLES = Array.from({ length: 10 }, (_, i) => ({ a: (i / 10) * Math.PI * 2 + rand(-.2, .2), r: rand(4.2, 6), ph: rand(0, 6), s: rand(0.25, 0.45) }));
+const TWINKLES =Array.from({ length: 10 }, (_, i) => ({ a: (i / 10) * Math.PI * 2 + rand(-.2, .2), r: rand(4.2, 6), ph: rand(0, 6), s: rand(0.25, 0.45) }));
 
 function render(now) {
   const base = Math.min(W, H) * CONFIG.faceScale;
-  const fillMul = Math.max(W / 4.4, H / 3.0) / base;
-  const grow = Math.pow(rageShown, 2.2);
-  const R = base * lerp(1, fillMul, grow);
-  const follow = 1 - grow * 0.9;
-
   const margin = Math.min(W, H) * CONFIG.edgeMargin;
+  // 커짐: 얼굴(눈 + 눈썹)이 화면 안에 꽉 차는 크기까지만 (떨림·맥동 여유분 포함) → 그 뒤로는 크기 고정
+  //   화난 얼굴 크기(R 단위): 좌우 반폭 ≈ 3.0, 위(눈썹 끝) ≈ -3.0, 아래(눈 끝) ≈ 1.4
+  const FACE_TOP = -3.0, FACE_BOTTOM = 1.4, FACE_HALF_W = 3.0;
+  const roomW = W / 2 - margin - base * 0.15, roomH = H / 2 - margin - base * 0.1;
+  const capR = Math.max(base, Math.min(roomW / FACE_HALF_W, roomH / ((FACE_BOTTOM - FACE_TOP) / 2)) / 1.08);
+  const grow = ease(rageShown);
+  const R = lerp(base, capR, grow);
+  const follow = 1 - grow * 0.95;
+
   const rangeX = Math.max(0, W / 2 - 3.3 * R - margin) * follow;
   const rangeY = Math.max(0, (H - 2 * margin - 4.4 * R) / 2) * follow;
   const gx = gaze.x.x, gy = gaze.y.x;
   let cx = W / 2 + gx * rangeX + mods.ox * W;
-  let cy = H / 2 + R * lerp(0.7, 0.35, grow) + gy * rangeY + mods.oy * H;
+  // 꽉 찰 때는 눈썹 끝 ~ 눈 아래 끝이 화면 세로 가운데에 오도록
+  let cy = H / 2 + R * lerp(0.7, -(FACE_TOP + FACE_BOTTOM) / 2, grow) + gy * rangeY + mods.oy * H;
   if (mods.shake > 0.001) { cx += rand(-1, 1) * base * mods.shake * 2; cy += rand(-1, 1) * base * mods.shake; }
 
   ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   ctx.fillStyle = rgb(bg); ctx.fillRect(0, 0, W, H);
-  if (rageShown > 0.01) {
-    const v = ctx.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.2, W / 2, H / 2, Math.max(W, H) * 0.75);
-    v.addColorStop(0, "rgba(0,0,0,0)");
-    v.addColorStop(1, `rgba(20,0,0,${0.7 * rageShown})`);
-    ctx.fillStyle = v; ctx.fillRect(0, 0, W, H);
-  }
   drawConfetti();
 
   // 얼굴 좌표계: 눈 중심을 원점으로, 기울기·찌그러짐 적용
@@ -730,8 +734,12 @@ function loop(now) {
   detect(now);
   updateState(now, dt);
 
+  // 모드 구분
+  //  - 인식된 대상 없음 → 두리번거림 모드: 다양한 표정·모션 연기 (idleAct)
+  //  - 대상 인식됨      → 시선 따라가기 모드: 대상을 바라보며 단계별 감정 표현 (stateMods)
+  //  ※ 반응을 마친 감상자(ignored)는 대상이 아니므로, 그 사람이 남아 있어도 두리번거림 모드
   const T = { ...MOD0 };
-  const following = ["track", "warn", "angry", "rage", "celebrate"].includes(state) && person;
+  const following = state !== "idle" && !!person;
   if (following) {
     const sign = CONFIG.mirror ? -1 : 1;
     gazeTarget = {
@@ -739,7 +747,7 @@ function loop(now) {
       y: clamp((person.y - CONFIG.trackCenterY) * 2 * CONFIG.trackGainY, -1, 1),
     };
     stateMods(now, T);
-  } else if (state === "idle" || state === "done") {
+  } else if (state === "idle") {
     idleAct(now, T);
   } else {
     gazeTarget = { x: 0, y: 0 };
@@ -774,10 +782,6 @@ function loop(now) {
   const rageTarget = state === "rage" ? clamp(moveMs / CONFIG.rageGrowMs, 0, 1) : 0;
   rageShown = lerp(rageShown, rageTarget, 1 - Math.exp(-dt * (state === "rage" ? 3 : 2)));
 
-  const tc = targetColor(now);
-  const toward = state === "rage" ? 6 : ["warn", "angry"].includes(state) ? 3 : 1.5;
-  bg = mixRGB(bg, tc, 1 - Math.exp(-dt * toward));
-
   updateConfetti(dt, now);
   render(now);
   if (debugOn) updateDebugText();
@@ -800,10 +804,10 @@ function drawDebug(res) {
 }
 function updateDebugText() {
   const next = { track: CONFIG.warnAfterMs, warn: CONFIG.angryAfterMs, angry: CONFIG.rageAfterMs, rage: CONFIG.rageGrowMs }[state];
-  const idleish = state === "idle" || state === "done";
+  const idleish = state === "idle";
   info.innerHTML =
     `상태: <b>${STATE_LABEL[state]}</b>${idleish ? ` · 연기: ${ACT_LABEL[act.name]}` : ""}${forced ? " (테스트 고정)" : ""}<br>` +
-    `인식 ${people.length}명 · 대상 ${person ? (performance.now() - lastSeen < 300 ? "고정 중" : "놓침(찾는 중)") : "없음"} · 판단: <b>${moving ? "움직임" : "멈춤"}</b> · 속도 ${speed.toFixed(2)}<br>` +
+    `인식 ${people.length}명 · 반응 끝난 사람 ${ignored ? "무시 중" : "없음"} · 대상 ${person ? (performance.now() - lastSeen < 300 ? "고정 중" : "놓침(찾는 중)") : "없음"} · 판단: <b>${moving ? "움직임" : "멈춤"}</b> · 속도 ${speed.toFixed(2)}<br>` +
     `반전 ${CONFIG.mirror ? "ON" : "OFF"}`;
   barStill.style.width = (clamp(stillMs / CONFIG.stillGoalMs, 0, 1) * 100) + "%";
   barMove.style.width = (next ? clamp(moveMs / next, 0, 1) * 100 : 0) + "%";
@@ -824,7 +828,7 @@ addEventListener("keydown", (e) => {
   if (k in map) { forced = true; setState(map[k], now); }
   const acts = { "6": "peek", "7": "doze", "8": pick(["skeptic", "tilt"]), "9": pick(["wonder", "hop", "spin"]) };
   if (k in acts) { forced = false; resetPerson(); state = "idle"; stateStart = now; moveMs = stillMs = 0; startAct(acts[k], now); }
-  if (k === "0") { forced = false; resetPerson(); setState("idle", now); }
+  if (k === "0") { forced = false; resetPerson(); ignored = null; setState("idle", now); }
 });
 
 // ───────────────────────── 시작 ─────────────────────────
