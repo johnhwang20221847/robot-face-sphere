@@ -488,23 +488,15 @@ function detect(now) {
   people = res.landmarks.map(summarize).filter(p => p.size >= CONFIG.minPersonSize);
 
   // 대상 고정: 한 번 식별된 감상자만 계속 따라감 (없으면 가장 가까운 사람)
-  const nearest = () => people.reduce((a, b) => (b.size > a.size ? b : a));
   let best = null;
-  if (person) {
-    best = matchNear(person, lastSeen, people, now);
-    // 절차 완료 후에는 지켜야 할 '단계 대상'이 없으므로, 잠깐이라도 놓치면 바로 가장 가까운 얼굴로 다시 붙음
-    if (!best && completed && people.length && now - lastSeen > 300) {
-      person = null; torso = null; torsoHist = [];
-      best = nearest();
-    }
-  } else if (people.length) best = nearest();
+  if (person) best = matchNear(person, lastSeen, people, now);
+  else if (people.length) best = people.reduce((a, b) => (b.size > a.size ? b : a));
 
   if (best) {
     // confirmed: 연속 N프레임 이상 잡힌 사람만 진짜 감상자로 인정 (순간적인 오인식 무시)
-    //  절차 완료 후에는 빨리 붙도록 2프레임이면 인정
-    person = person ? { ...best, x: lerp(person.x, best.x, .5), y: lerp(person.y, best.y, .5), confirmed: person.confirmed } : { ...best, confirmed: false };
+    person = person ? { ...best, x: lerp(person.x, best.x, .5), y: lerp(person.y, best.y, .5), confirmed: person.confirmed } : best;
     seenFrames++; lastSeen = now;
-    if (seenFrames >= (completed ? 2 : CONFIG.enterFrames)) person.confirmed = true;
+    if (seenFrames >= CONFIG.enterFrames) person.confirmed = true;
     measureMotion(best, now);
   } else {
     seenFrames = 0;
